@@ -56,6 +56,14 @@ Add one more with subject `repo:<OWNER>/<REPO>:ref:refs/heads/main` (name it e.g
 environment — and only reads (state + a script/report diff). Binding to the `main` ref keeps it
 issuable solely to workflows already merged past the PR gate.
 
+> **If the repository was ever deleted and recreated** (even under the same name), GitHub
+> issues its OIDC tokens with an *immutable* ID-embedded subject —
+> `repo:<owner>@<owner-id>/<repo>@<repo-id>:...` — as a defense against repo-name
+> resurrection, and this cannot be customized away. Every federated credential's subject must
+> then use that exact prefix (find it in the `AADSTS700213` error of a failed login, or via
+> `GET /repos/<owner>/<repo>/actions/oidc/customization/sub`); update the credentials with
+> `az identity federated-credential update`.
+
 Then grant the identity what the model needs:
 
 - **Tenant setting** — enable *service principals can use Fabric APIs*
