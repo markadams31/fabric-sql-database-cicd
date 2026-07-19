@@ -5,5 +5,5 @@
 # caller needs only Storage Blob Data Contributor on the container.
 storage_account_name = "<state-storage-account-name>"
 container_name       = "<state-container-name>"
-key                  = "dev.tfstate"
+key                  = "fabric-sql-database-cicd/dev.tfstate"
 tenant_id            = "<entra-tenant-id>"

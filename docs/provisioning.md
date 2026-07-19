@@ -176,7 +176,7 @@ it is done in the Fabric portal:
 
    | Variable | Value |
    |---|---|
-   | `TFSTATE_KEY` | this environment's state file, e.g. `dev.tfstate` |
+   | `TFSTATE_KEY` | this environment’s state file; prefix it with the repo name for provenance in a shared container, e.g. `fabric-sql-database-cicd/dev.tfstate` |
    | `FABRIC_CAPACITY_NAME` | the Fabric capacity this environment uses, by **display name** — the normal path on a paid F-SKU (the deploy identity resolves it and validates it is Active). Set this **or** `FABRIC_CAPACITY_ID`, not both |
    | `FABRIC_CAPACITY_ID` | the capacity by **ID** — for capacities the identity can't enumerate by name (e.g. a trial). There also set `SKIP_CAPACITY_STATE_VALIDATION=true`, which turns off the Active check the name path performs |
    | `TF_DATABASES` | the databases map as JSON, e.g. `{"AppDb":{}}` |

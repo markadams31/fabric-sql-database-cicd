@@ -208,7 +208,7 @@ jobs:
           # does not bind (binding it would gate the plan behind the approval it exists to
           # inform). The state backend identifiers are repository-level; only the state KEY is
           # per-environment, and prod's follows the documented convention.
-          TFSTATE_KEY_PROD: prod.tfstate
+          TFSTATE_KEY_PROD: fabric-sql-database-cicd/prod.tfstate
         run: |
           set -euo pipefail
           terraform init -input=false \
