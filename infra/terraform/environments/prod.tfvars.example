@@ -1,0 +1,35 @@
+# Copy to prod.tfvars (git-ignored) and fill in your identifiers.
+
+environment = "prod"
+
+# See dev.tfvars.example for the capacity_name vs capacity_id choice.
+capacity_id                    = "00000000-0000-0000-0000-000000000000"
+skip_capacity_state_validation = true
+
+# Prod uses the maximum PITR window unless a database overrides it.
+default_backup_retention_days = 35
+
+# Grant your team's security group a role on every workspace (see dev.tfvars.example).
+workspace_operators = {
+  team = {
+    principal_id   = "00000000-0000-0000-0000-000000000000"
+    principal_type = "Group"
+    role           = "Admin"
+  }
+}
+
+databases = {
+  AppDb = {}
+
+  # Grant team access on top of the deploy identity (which is auto-Admin as creator).
+  # In prod keep it least-privilege. principal_id is an Entra OBJECT (principal) ID.
+  # AppDb = {
+  #   additional_role_assignments = {
+  #     data_engineers = {
+  #       principal_id   = "<entra-group-object-id>"
+  #       principal_type = "Group"
+  #       role           = "Viewer"
+  #     }
+  #   }
+  # }
+}

@@ -1,0 +1,44 @@
+# .NET / SQL project build output
+bin/
+obj/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Python build artifacts (the SQLFluff rule plugin)
+__pycache__/
+*.egg-info/
+build/
+dist/
+
+# Claude Code session data
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets, credentials & local environment — never commit these. The *.example templates end
+# in .example, so none of these patterns match them; the templates stay committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.p12
+*.key
+*.pubxml.user
+
+# Terraform real values, state, and plans — wherever they live. infra/terraform/.gitignore
+# has the same rules scoped to that folder; these are the belt-and-suspenders copies so a
+# sensitive Terraform file added anywhere else is still excluded.
+*.tfvars
+*.tfvars.json
+*.backend.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/

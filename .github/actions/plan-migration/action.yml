@@ -1,0 +1,129 @@
+name: Plan a database migration
+description: >
+  Generate the exact migration T-SQL a dacpac publish would run against a live database, plus a
+  reviewer-facing data-loss digest and a semantic fingerprint. Used twice per prod deploy: once
+  BEFORE the approval gate (the reviewed plan) and once after it (the verify step) - the
+  fingerprints must match or the publish refuses to run. Also used by dev/test legs so every
+  environment's run summary states its own data-loss consequences.
+
+inputs:
+  database:
+    description: Database name (dacpac name)
+    required: true
+  environment:
+    description: Environment label for the summary heading
+    required: true
+  entry:
+    description: This database's Terraform outputs entry (JSON with sql_server_fqdn, sql_database_name, reader_group_*)
+    required: true
+  dacpac-dir:
+    description: Directory containing <database>.dacpac
+    required: false
+    default: artifacts
+  profile:
+    description: SqlPackage publish profile path
+    required: false
+    default: deploy/fabric.publish.xml
+  out-dir:
+    description: Directory to write the script, digest, and fingerprint into
+    required: false
+    default: migration
+
+outputs:
+  fingerprint:
+    description: Semantic fingerprint of the planned migration (normalized script + data-loss digest)
+    value: ${{ steps.plan.outputs.fingerprint }}
+  has-data-loss:
+    description: "'true' when the plan contains data-loss operations"
+    value: ${{ steps.plan.outputs.has_data_loss }}
+
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        DB: ${{ inputs.database }}
+        ENVLABEL: ${{ inputs.environment }}
+        ENTRY: ${{ inputs.entry }}
+        DACPAC_DIR: ${{ inputs.dacpac-dir }}
+        PROFILE: ${{ inputs.profile }}
+        OUT: ${{ inputs.out-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT"
+
+        retry() {
+          local n=1 max=4 delay=15
+          until "$@"; do
+            if [ "$n" -ge "$max" ]; then echo "::error::command failed after $max attempts."; return 1; fi
+            echo "::warning::attempt $n/$max failed; retrying in ${delay}s (Fabric serverless resume can take a moment)..."
+            sleep "$delay"; delay=$((delay * 2)); n=$((n + 1))
+          done
+        }
+
+        token=$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)
+        echo "::add-mask::$token"
+
+        server=$(jq -r '.sql_server_fqdn' <<<"$ENTRY"); server="${server#tcp:}"; server="${server%%,*}"
+        dbname=$(jq -r '.sql_database_name'          <<<"$ENTRY")
+        rg_oid=$(jq -r '.reader_group_object_id'     <<<"$ENTRY")
+        rg_name=$(jq -r '.reader_group_display_name' <<<"$ENTRY")
+        target=(/TargetServerName:"tcp:${server},1433" /TargetDatabaseName:"$dbname" /AccessToken:"$token" /TargetTimeout:60)
+        readervars=(/v:ReaderGroupName="$rg_name" /v:ReaderGroupObjectId="$rg_oid")
+
+        # 1) The exact T-SQL this publish would run. BlockOnPossibleDataLoss=False here only so a
+        #    data-loss change is SCRIPTED for review - the publish itself keeps the profile's True.
+        retry sqlpackage /Action:Script /SourceFile:"${DACPAC_DIR}/${DB}.dacpac" \
+          "${target[@]}" "${readervars[@]}" \
+          /Profile:"$PROFILE" /p:BlockOnPossibleDataLoss=False \
+          /DeployScriptPath:"${OUT}/${DB}.sql"
+
+        # 2) The data-loss digest, from the DeployReport's alert stream - the reliable signal for
+        #    "this change destroys data" (e.g. "The column [x].[y] is being dropped, data loss
+        #    could occur."). Parsed with grep, sorted for determinism.
+        retry sqlpackage /Action:DeployReport /SourceFile:"${DACPAC_DIR}/${DB}.dacpac" \
+          "${target[@]}" "${readervars[@]}" \
+          /Profile:"$PROFILE" /p:BlockOnPossibleDataLoss=False \
+          /OutputPath:"${OUT}/${DB}.deployreport.xml"
+        grep -oE '<Issue[^>]*Value="[^"]*"' "${OUT}/${DB}.deployreport.xml" \
+          | sed -E 's/.*Value="([^"]*)"/\1/' | sort -u > "${OUT}/${DB}.digest.txt" || true
+
+        # 3) Semantic fingerprint: normalized script (comments and blank lines dropped, CRs
+        #    stripped) + the digest. Two plans with the same fingerprint apply the same change;
+        #    a target that drifted between review and apply produces a different one.
+        {
+          sed -e 's/\r$//' -e '/^[[:space:]]*--/d' -e '/^[[:space:]]*$/d' "${OUT}/${DB}.sql"
+          cat "${OUT}/${DB}.digest.txt"
+        } | sha256sum | cut -d' ' -f1 > "${OUT}/${DB}.fingerprint"
+        fingerprint=$(cat "${OUT}/${DB}.fingerprint")
+        echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+        # 4) Reviewer-facing summary: the data-loss verdict first, the full T-SQL behind a fold.
+        n_issues=$(grep -c . "${OUT}/${DB}.digest.txt" || true)
+        if [ "${n_issues:-0}" -gt 0 ]; then
+          echo "has_data_loss=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_data_loss=false" >> "$GITHUB_OUTPUT"
+        fi
+        bytes=$(wc -c < "${OUT}/${DB}.sql")
+        {
+          echo "### Plan: \`$DB\` -> \`$dbname\` ($ENVLABEL)"
+          echo ""
+          if [ "${n_issues:-0}" -gt 0 ]; then
+            echo "> [!WARNING]"
+            echo "> **Data loss: ${n_issues} operation(s)**"
+            sed 's/^/> - /' "${OUT}/${DB}.digest.txt"
+          else
+            echo "**Data loss: none** - the planned change is non-destructive."
+          fi
+          echo ""
+          echo "- **Plan fingerprint:** \`${fingerprint:0:16}…\`"
+          echo ""
+          echo "<details><summary>Planned migration T-SQL</summary>"
+          echo ""
+          if [ "$bytes" -lt 60000 ]; then printf '```sql\n'; cat "${OUT}/${DB}.sql"; printf '\n```\n'
+          else echo "_Script is ${bytes} bytes - see this run's migration artifact for the full T-SQL._"; fi
+          echo ""
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"

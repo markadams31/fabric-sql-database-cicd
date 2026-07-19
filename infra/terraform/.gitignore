@@ -1,0 +1,27 @@
+# Local Terraform state, plans, and provider cache — never commit these.
+.terraform/
+*.tfstate
+*.tfstate.*
+# Terraform plan output files. Prefer naming plans *.tfplan; these patterns also catch the
+# ad-hoc names used in local plan/apply and decommission runs so a binary plan can't be committed.
+*.tfplan
+tfplan*
+destroy-*
+crash.log
+crash.*.log
+
+# Real per-environment values hold your tenant/subscription/capacity/storage identifiers.
+# Commit only the *.example templates; keep the filled-in files local.
+*.tfvars
+*.tfvars.json
+*.auto.tfvars.json
+*.backend.hcl
+
+# Override files are for local experimentation only.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# The dependency lock file (.terraform.lock.hcl) is intentionally NOT ignored — commit it
+# so provider versions are reproducible across machines and CI.

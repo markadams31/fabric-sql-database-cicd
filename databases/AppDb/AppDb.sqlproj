@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build">
+  <Sdk Name="Microsoft.Build.Sql" />
+  <PropertyGroup>
+    <Name>AppDb</Name>
+    <!-- Target platform, code analysis, and the rule set are inherited from
+         ../Directory.Build.props. This project only names itself and its scripts. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Scripts/ are not schema objects: PostDeployment runs on every publish, DataMigrations
+         scripts run as their own gated pipeline step. Keep both out of the compiled model. -->
+    <Build Remove="Scripts/**/*.sql" />
+    <PostDeploy Include="Scripts/PostDeployment/PostDeployment.sql" />
+    <None Include="Scripts/DataMigrations/**/*.sql" />
+  </ItemGroup>
+  <!-- Deploy-time inputs for the post-deployment script, filled from the Terraform outputs by
+       the deploy pipeline (SqlPackage /v:ReaderGroupName=... /v:ReaderGroupObjectId=...). Empty
+       defaults make a plain build and a variable-less publish a safe no-op. -->
+  <ItemGroup>
+    <SqlCmdVariable Include="ReaderGroupName">
+      <DefaultValue></DefaultValue>
+      <Value>$(SqlCmdVar__ReaderGroupName)</Value>
+    </SqlCmdVariable>
+    <SqlCmdVariable Include="ReaderGroupObjectId">
+      <DefaultValue></DefaultValue>
+      <Value>$(SqlCmdVar__ReaderGroupObjectId)</Value>
+    </SqlCmdVariable>
+  </ItemGroup>
+</Project>

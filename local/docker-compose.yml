@@ -1,0 +1,32 @@
+# Local SQL Server for hands-on testing of the built dacpac. SQL Server is the same engine
+# family as Fabric SQL but NOT Fabric — this is a fast, offline way to deploy the schema and
+# poke around with a client tool, not a Fabric-fidelity test (Entra auth, contained users, and
+# platform limits are not reproduced here). See README.md. Start with:
+#   docker compose -f local/docker-compose.yml up -d --wait
+services:
+  sql:
+    # SQL Server 2025 — the newest engine, the closest local approximation to Fabric's
+    # evergreen SQL. Still not Fabric (see README.md); it's engine truth, not Fabric fidelity.
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: fabric-cicd-local-sql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      # Local-only throwaway password, reachable only on localhost. Override by exporting
+      # MSSQL_SA_PASSWORD before `up`; it must meet SQL Server's complexity rules.
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Local_Dev_Passw0rd!}"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      # Try the bundled mssql-tools18 sqlcmd, then fall back to sqlcmd on PATH (image layouts
+      # vary by version); -C trusts the container's self-signed cert.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' 2>/dev/null || sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  mssql-data:

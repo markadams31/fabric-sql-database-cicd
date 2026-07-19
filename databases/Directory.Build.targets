@@ -1,0 +1,14 @@
+<Project>
+  <!--
+    Compose the DacFx analysis rule set from the per-rule severity knobs (SqlRule_*) declared in
+    Directory.Build.props. This runs in a .targets file on purpose: MSBuild imports it AFTER the
+    entire Directory.Build.props chain, including any per-database databases/<name>/Directory.Build.props
+    override. So a database that sets a single SqlRule_* property changes exactly that rule, and the
+    joined SqlCodeAnalysisRules never contains a duplicate rule id (which DacFx rejects with
+    "SQL72039: An item with the same key has already been added"). One place builds the string;
+    nobody hand-maintains it.
+  -->
+  <PropertyGroup>
+    <SqlCodeAnalysisRules>$(SqlRule_SelectStar);$(SqlRule_Waitfor);$(SqlRule_AuditColumns);$(SqlRule_AuditTrigger);$(SqlRule_BoundedStrings);$(SqlRule_NaturalKey);$(SqlRule_PageVerify);$(SqlRule_QueryStore);$(SqlRule_TargetRecovery)</SqlCodeAnalysisRules>
+  </PropertyGroup>
+</Project>

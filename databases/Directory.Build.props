@@ -1,0 +1,120 @@
+<Project>
+  <!--
+    Shared conventions for EVERY SQL Database Project under databases/. This file is
+    auto-imported by each databases/<name>/*.sqlproj, so a new database is just a folder with a
+    name-only project that inherits all of this. The enforced rule set lives here - one place
+    to read and change.
+
+    Per-database rules: each rule's severity is its own MSBuild property (the SqlRule_* knobs
+    below), and Directory.Build.targets composes them into the single SqlCodeAnalysisRules
+    string DacFx reads. To change ONE rule for ONE database, add its own
+    databases/<name>/Directory.Build.props, import this file, and set just that one knob:
+
+        <Project>
+          <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+          <PropertyGroup>
+            <SqlRule_BoundedStrings>+!Fabric.SR1003</SqlRule_BoundedStrings>
+
+        (that one line flips Fabric.SR1003 from warning to error for this database only)
+          </PropertyGroup>
+        </Project>
+
+    That is the whole override - no restating the full set. This exists because DacFx rejects a
+    rule id that appears more than once in SqlCodeAnalysisRules ("SQL72039: An item with the
+    same key has already been added"), so the old "append your change" approach crashed the
+    build; setting a per-rule property can never produce a duplicate id.
+  -->
+
+  <PropertyGroup>
+    <!-- Target the "SQL database in Fabric" platform, so T-SQL the platform does not support
+         fails at BUILD rather than at deploy. Target-platform reference:
+         https://learn.microsoft.com/sql/tools/sql-database-projects/concepts/target-platform -->
+    <DSP>Microsoft.Data.Tools.Schema.Sql.SqlDbFabricDatabaseSchemaProvider</DSP>
+
+    <!-- The project MODEL's collation (LCID 1033, case-insensitive), used when comparing
+         object names during build. This is not the deployed database's data collation. -->
+    <ModelCollation>1033, CI</ModelCollation>
+
+    <!-- dacpac version stamp, for build-once / promote-the-same-artifact traceability. CI
+         overrides it (dotnet build -p:DacVersion=<version>); this floor is for local builds. -->
+    <DacVersion Condition="'$(DacVersion)' == ''">1.0.0</DacVersion>
+
+    <!-- Run DacFx static code analysis as part of the build. -->
+    <RunSqlCodeAnalysis>True</RunSqlCodeAnalysis>
+
+    <!-- Treat genuine T-SQL build warnings (e.g. an unresolved reference) as errors. NOTE:
+         this does NOT change code-analysis rule severity - that is per-rule, below. -->
+    <TreatTSqlWarningsAsErrors>True</TreatTSqlWarningsAsErrors>
+
+    <!--
+      Analysis rule severity, one property per rule. Directory.Build.targets joins these into
+      the single SqlCodeAnalysisRules string DacFx reads. Each value is one ';'-entry:
+
+          +!RuleId    ERROR     - fails the build
+          +RuleId     WARNING   - reported, does not fail the build
+          -RuleId     DISABLED
+          (unlisted)  WARNING   - the default, because RunSqlCodeAnalysis is on
+
+      So WARNING is the default; "+!" blocks on a rule, "-" silences one. Override exactly one
+      of these in a per-database Directory.Build.props (see the header comment) - the Condition
+      lets that override win, and one-property-per-rule means an override can never produce the
+      duplicate rule id that crashes DacFx.
+
+      Built-in DacFx rules (Microsoft.Rules.Data.*) -
+      https://learn.microsoft.com/sql/tools/sql-database-projects/concepts/sql-code-analysis/sql-code-analysis
+          SR0001  ERROR   Avoid SELECT * (result-set shape silently changes with the table).
+          SR0008  ERROR   Avoid WAITFOR DELAY/TIME in shipped objects.
+      Custom rules in this repo - analyzers/FabricSqlRules (WARNING; add "!" for error):
+          Fabric.SR1001  WARNING   Every table must define the standard audit columns.
+          Fabric.SR1002  WARNING   A table with audit columns must have an audit trigger.
+          Fabric.SR1003  WARNING   String/binary columns declare a bounded length (no MAX).
+      Community rules (SqlServer.Rules.*) - https://github.com/ErikEJ/SqlServer.Rules/tree/master/docs
+          SRD0001  DISABLED  "no natural key" - these projects use surrogate keys by design.
+          SRD0700  DISABLED  PAGE_VERIFY database option - managed by Fabric.
+          SRD0703  DISABLED  QUERY_STORE_CAPTURE_MODE option - managed by Fabric.
+          SRD0704  DISABLED  TARGET_RECOVERY_TIME option - managed by Fabric.
+      Every other SqlServer.Rules rule runs as a WARNING (add a new SqlRule_* knob to change one).
+    -->
+    <SqlRule_SelectStar     Condition="'$(SqlRule_SelectStar)' == ''">+!Microsoft.Rules.Data.SR0001</SqlRule_SelectStar>
+    <SqlRule_Waitfor        Condition="'$(SqlRule_Waitfor)' == ''">+!Microsoft.Rules.Data.SR0008</SqlRule_Waitfor>
+    <SqlRule_AuditColumns   Condition="'$(SqlRule_AuditColumns)' == ''">+Fabric.SR1001</SqlRule_AuditColumns>
+    <SqlRule_AuditTrigger   Condition="'$(SqlRule_AuditTrigger)' == ''">+Fabric.SR1002</SqlRule_AuditTrigger>
+    <SqlRule_BoundedStrings Condition="'$(SqlRule_BoundedStrings)' == ''">+Fabric.SR1003</SqlRule_BoundedStrings>
+    <SqlRule_NaturalKey     Condition="'$(SqlRule_NaturalKey)' == ''">-SqlServer.Rules.SRD0001</SqlRule_NaturalKey>
+    <SqlRule_PageVerify     Condition="'$(SqlRule_PageVerify)' == ''">-SqlServer.Rules.SRD0700</SqlRule_PageVerify>
+    <SqlRule_QueryStore     Condition="'$(SqlRule_QueryStore)' == ''">-SqlServer.Rules.SRD0703</SqlRule_QueryStore>
+    <SqlRule_TargetRecovery Condition="'$(SqlRule_TargetRecovery)' == ''">-SqlServer.Rules.SRD0704</SqlRule_TargetRecovery>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Community DacFx rule set (140+ design/naming/performance rules), run at build.
+         Home: https://github.com/ErikEJ/SqlServer.Rules
+         A plain <PackageReference> lets NuGet add the package's analyzers/ DLL as a *Roslyn*
+         analyzer, which Microsoft.Build.Sql cannot load as a DacFx rule assembly ("... is not a
+         valid directory or assembly") - so the ~140 rules silently do NOT run. Instead we exclude
+         that auto-inclusion and wire the netstandard2.1 assembly as a DacFx <Analyzer> ourselves,
+         exactly like the custom rules below. -->
+    <PackageReference Include="ErikEJ.DacFX.SqlServer.Rules" Version="5.1.2"
+                      GeneratePathProperty="true" ExcludeAssets="all" />
+
+    <!-- This repo's own rules, a normal C# class library loaded as an analyzer. Add a rule
+         there to enforce an organization convention SqlServer.Rules does not cover. -->
+    <ProjectReference Include="$(MSBuildThisFileDirectory)../analyzers/FabricSqlRules/FabricSqlRules.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- Wire the ErikEJ community rules as a DacFx analyzer. NuGet auto-adds the package's
+       analyzers/dotnet/cs/*.dll (net472 + a "NetFx" variant) as Roslyn analyzers, which
+       Microsoft.Build.Sql cannot load as DacFx rule assemblies ("... is not a valid directory or
+       assembly") - leaving the ~140 rules silently OFF. After restore, strip anything the package
+       contributed and add ONLY the clean netstandard2.1 assembly, the same way the custom rules
+       above are wired. Runs after ResolvePackageAssets so @(Analyzer) is already populated. -->
+  <Target Name="_WireErikEJDacFxRules" BeforeTargets="SqlStaticCodeAnalysis"
+          Condition="'$(PkgErikEJ_DacFX_SqlServer_Rules)' != ''">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)"
+                Condition="$([System.String]::Copy('%(Filename)').StartsWith('SqlServer.Rules'))" />
+      <Analyzer Include="$(PkgErikEJ_DacFX_SqlServer_Rules)\lib\netstandard2.1\SqlServer.Rules.dll" />
+    </ItemGroup>
+  </Target>
+</Project>

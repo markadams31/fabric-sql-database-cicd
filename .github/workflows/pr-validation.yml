@@ -1,0 +1,34 @@
+name: PR validation
+
+# The authoritative gate: lint + build (schema validation + all code analysis rules).
+# The same checks run locally via the pre-commit hooks; here they are enforced on every PR.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install SQLFluff + the repo's custom rule plugin
+        run: pip install sqlfluff==4.2.2 ./analyzers/sqlfluff-fabric-rules
+
+      - name: Lint (SQLFluff)
+        run: sqlfluff lint databases
+
+      - name: Build — schema validation + code analysis
+        run: dotnet build build.proj

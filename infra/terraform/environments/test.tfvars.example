@@ -1,0 +1,22 @@
+# Copy to test.tfvars (git-ignored) and fill in your identifiers.
+
+environment = "test"
+
+# See dev.tfvars.example for the capacity_name vs capacity_id choice.
+capacity_id                    = "00000000-0000-0000-0000-000000000000"
+skip_capacity_state_validation = true
+
+default_backup_retention_days = 14
+
+# Grant your team's security group a role on every workspace (see dev.tfvars.example).
+workspace_operators = {
+  team = {
+    principal_id   = "00000000-0000-0000-0000-000000000000"
+    principal_type = "Group"
+    role           = "Admin"
+  }
+}
+
+databases = {
+  AppDb = {}
+}

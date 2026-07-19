@@ -1,0 +1,8 @@
+# Keep build output out of the lint (obj/ lands under databases/). .gitignore won't do this.
+bin/
+obj/
+
+# Post-deployment scripts use SQLCMD variables ($(...)) and dynamic SQL the schema linter
+# can't parse — they're operational scripts, not schema objects. (Leading **/ so the match
+# isn't anchored to the repo root, since the path has an internal slash.)
+**/Scripts/PostDeployment/

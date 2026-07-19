@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.Build.Traversal">
+  <!--
+    Builds every project in the repo. A database is just a folder: drop a databases/<name>/ SQL
+    project in and it is picked up here automatically — no registration and no solution file
+    to hand-maintain. `dotnet build build.proj` builds them all (this is what the git hooks
+    and CI run). The Traversal SDK version is pinned in global.json.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="analyzers/**/*.csproj" />
+    <ProjectReference Include="databases/**/*.sqlproj" />
+  </ItemGroup>
+</Project>

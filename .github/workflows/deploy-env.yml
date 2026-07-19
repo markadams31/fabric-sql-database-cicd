@@ -1,0 +1,477 @@
+name: Deploy one database to one environment (reusable)
+
+# Called by deploy.yml once per (environment, database) as a matrix leg, so each database deploys
+# INDEPENDENTLY - one database's failure never strands another. prod's required reviewer pauses
+# the run here.
+#
+# Provisioning (provision.yml) must have created the empty Fabric SQL database first; this only
+# delivers schema. If the database is not provisioned in this environment yet, the job SKIPS
+# cleanly (no-op) rather than failing - so a merge that adds a new database before it is
+# provisioned does not break the deploy.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target GitHub environment (dev | test | prod)
+        required: true
+        type: string
+      database:
+        description: Database name (= dacpac <Name> = Terraform databases-map key)
+        required: true
+        type: string
+      artifact:
+        description: Build-once dacpac artifact to promote
+        required: true
+        type: string
+      allow_data_loss:
+        description: Reviewed override permitting a destructive (data-loss) change to publish
+        required: false
+        type: boolean
+        default: false
+      plan_artifact:
+        description: >-
+          Name of a reviewed-plan artifact (from the pre-gate plan job) this leg must match
+          before publishing. When set, the leg re-plans against the live target and refuses to
+          publish if the fingerprints differ - the approved plan is the only plan that applies.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write # mint the GitHub OIDC token for federated login to the managed identity
+
+# One deploy at a time per (database, environment). On dev/test a newer deploy SUPERSEDES an
+# older one for the same pair (cancel-in-progress), so a stale run can't hold the lock. PROD is
+# the exception: a superseding push must never kill a prod leg mid-publish or mid-data-migration,
+# so prod runs queue instead of cancelling - the worst case is a newer run waiting behind an
+# older one (including one parked at the approval gate; cancel that stale run manually to let
+# the newer one through). Every OTHER (db, env) pair stays independent either way.
+concurrency:
+  group: deploy-${{ inputs.environment }}-${{ inputs.database }}
+  cancel-in-progress: ${{ inputs.environment != 'prod' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Generous but finite: readiness wait (<=15m) + plan + publish + migrations fits comfortably;
+    # a hung leg releases its per-(db, env) concurrency slot instead of holding it for the
+    # 6-hour default. (Time at the prod approval gate does NOT count toward this.)
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }} # prod's required reviewer pauses the run here
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      FABRIC_USE_OIDC: "true"
+      FABRIC_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      FABRIC_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      DB: ${{ inputs.database }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      # Build-once promotes the same dacpac BYTES, but SqlPackage computes the deployment PLAN,
+      # so an unpinned "latest" could diff differently between the dev and prod legs of the SAME
+      # run. Pin it. Keep SQLPACKAGE_VERSION in step with the DacFx version the analyzers build
+      # against (analyzers/FabricSqlRules/FabricSqlRules.csproj), so the build model and the
+      # publish engine agree. Job-level because the version participates in the tool cache key
+      # AND the deployed-source hash (a new engine can produce a new plan for the same sources).
+      SQLPACKAGE_VERSION: "170.4.83"
+      SQLCMD_VERSION: "v1.10.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the promoted dacpacs (build once, deploy the same bytes everywhere)
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact }}
+          path: artifacts
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Cache SqlPackage + sqlcmd (pinned versions, so the cache never staleness-drifts)
+        id: toolcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.dotnet/tools
+            ~/sqlcmd-bin
+          key: sqltools-${{ runner.os }}-sqlpackage-${{ env.SQLPACKAGE_VERSION }}-sqlcmd-${{ env.SQLCMD_VERSION }}
+
+      - name: Install SqlPackage + sqlcmd (versions pinned so every leg diffs identically)
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.toolcache.outputs.cache-hit }}" != "true" ]; then
+            dotnet tool install --global Microsoft.SqlPackage --version "$SQLPACKAGE_VERSION"
+            # sqlcmd (go-sqlcmd) runs the data-migration scripts below. Pinned, not "latest".
+            mkdir -p "$HOME/sqlcmd-bin"
+            curl -fsSL "https://github.com/microsoft/go-sqlcmd/releases/download/${SQLCMD_VERSION}/sqlcmd-linux-amd64.tar.bz2" -o /tmp/sqlcmd.tar.bz2
+            tar xjf /tmp/sqlcmd.tar.bz2 -C "$HOME/sqlcmd-bin" sqlcmd
+          fi
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          sudo cp "$HOME/sqlcmd-bin/sqlcmd" /usr/local/bin/sqlcmd
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false # let `terraform output -json` return raw JSON on stdout
+
+      - name: Azure login (user-assigned managed identity via OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true # the identity's rights live in Fabric/Entra, not sub RBAC
+
+      - name: Resolve this database's endpoint from Terraform state
+        id: tf
+        working-directory: infra/terraform
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TFSTATE_KEY }}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform output -json databases > "$RUNNER_TEMP/dbs.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/dbs.json"
+          entry=$(jq -c --arg k "$DB" '.[$k] // empty' "$RUNNER_TEMP/dbs.json")
+          if [ -z "$entry" ]; then
+            echo "provisioned=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DB is not provisioned in $ENVIRONMENT yet - skipping (run provision.yml first)."
+          else
+            echo "provisioned=true" >> "$GITHUB_OUTPUT"
+            echo "entry=$entry" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail-fast marker: an immutable cache entry written after each successful leg. A hit
+      # proves this (workspace, database) pair deployed before, which rules out the
+      # "fresh-workspace role propagation" cause of a login failure BY CONSTRUCTION - so the
+      # readiness wait below can fail at 5 minutes with a definitive verdict instead of 15
+      # with a two-cause shrug. Cache eviction just restores the full 15-minute wait (safe).
+      - name: Check the deployed-before marker
+        id: marker
+        if: steps.tf.outputs.provisioned == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .deployed-marker
+          key: deployed-${{ inputs.environment }}-${{ inputs.database }}-${{ fromJson(steps.tf.outputs.entry).workspace_id }}
+
+      - name: Wait until the database accepts the deploy identity (fresh-workspace access can lag)
+        if: steps.tf.outputs.provisioned == 'true'
+        env:
+          ENTRY: ${{ steps.tf.outputs.entry }}
+          DEPLOYED_BEFORE: ${{ steps.marker.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          # A brand-new Fabric workspace grants the deploy identity its workspace role
+          # immediately, but the SQL data plane can take several minutes (occasionally much
+          # longer) to honor it - so the FIRST deploy right after provisioning otherwise fails
+          # with "Login failed ... Verify the user has the Read item permission". Serverless
+          # databases also resume on first connect. Poll a trivial SELECT until the identity can
+          # actually connect, with a generous ceiling, so provision-then-deploy is not a race.
+          # Steady-state deploys (access already propagated) pass on the first try in seconds.
+          #
+          # The SAME login error is also produced by capacity THROTTLING: when the capacity's
+          # smoothed compute debt crosses the rejection threshold, Fabric rejects new SQL
+          # connections and the gateway reports it as a permission-validation failure. On small
+          # SKUs (F2/F4) a normal deploy burst can trigger this - see docs/operations.md. The
+          # loop prints the client error each attempt so the two causes are distinguishable.
+          server=$(jq -r '.sql_server_fqdn' <<<"$ENTRY"); server="${server#tcp:}"; server="${server%%,*}"
+          dbname=$(jq -r '.sql_database_name' <<<"$ENTRY")
+          if [ "$DEPLOYED_BEFORE" = "true" ]; then
+            # Deployed before -> fresh-workspace propagation is impossible; a login failure here
+            # is capacity throttling or a platform authorization issue, and 15 minutes of waiting
+            # rarely rescues either. Fail at 5 with the definitive verdict.
+            deadline=$((SECONDS + 300))
+            verdict="This database has deployed before, so this is NOT role propagation - it is capacity throttling (let the debt burn down or suspend/resume the capacity) or a platform authorization issue (re-run later). See docs/operations.md."
+          else
+            deadline=$((SECONDS + 900)) # first deploy: up to 15 minutes for role propagation
+            verdict="Two known causes: (1) a brand-new workspace's role grant is still propagating to the SQL endpoint - re-run shortly, or force the sync by re-applying the deploy identity's workspace role assignment (remove, apply, re-add, apply); (2) the capacity is throttling and rejecting connections - let the debt burn down or suspend/resume it. See docs/operations.md."
+          fi
+          n=0
+          delay=30 # escalate 30 -> 60 -> 120 and hold: throttling debt burns down on the scale of minutes, so rapid re-probes only add load
+          # go-sqlcmd prints login errors on STDOUT, so capture both streams (the success case's
+          # "SELECT 1" output is discarded by the until-success control flow anyway).
+          until err=$(sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b -l 30 -Q "SELECT 1;" 2>&1); do
+            n=$((n + 1))
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$dbname did not accept the deploy identity within $(( (deadline > 600) ? 15 : 5 )) min. Last client error: ${err}. ${verdict}"
+              exit 1
+            fi
+            echo "::notice::attempt $n: $dbname not reachable/authorized yet; client error: ${err}; waiting ${delay}s..."
+            sleep "$delay"
+            [ "$delay" -lt 120 ] && delay=$((delay * 2))
+          done
+          echo "$dbname accepts the deploy identity."
+
+      - name: Detect drift (objects in the target the source does not declare)
+        if: steps.tf.outputs.provisioned == 'true'
+        env:
+          ENTRY: ${{ steps.tf.outputs.entry }}
+          PROFILE: deploy/fabric.publish.xml
+        run: |
+          set -euo pipefail
+          # The publish deliberately IGNORES objects the source doesn't declare
+          # (DropObjectsNotInSource=False), and a hash-skipped leg doesn't diff at all - so an
+          # out-of-band table or view would otherwise survive green runs indefinitely. This
+          # report-only diff flips DropObjectsNotInSource=True (NEVER applied) and fails the leg
+          # if it would drop anything: any reported drop IS drift, and drift is an incident -
+          # the repo stopped being the single source of truth. Reconcile by adding the object to
+          # source or removing it from the target, then re-run.
+          #
+          # Users, role memberships, permissions, and extended properties are excluded: the
+          # post-deployment script and the pipeline's own stamps legitimately manage those
+          # outside the model. Column-level drift needs no special handling here - a real
+          # publish diffs columns anyway and the data-loss block catches destructive ones.
+          token=$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          server=$(jq -r '.sql_server_fqdn' <<<"$ENTRY"); server="${server#tcp:}"; server="${server%%,*}"
+          dbname=$(jq -r '.sql_database_name'          <<<"$ENTRY")
+          rg_oid=$(jq -r '.reader_group_object_id'     <<<"$ENTRY")
+          rg_name=$(jq -r '.reader_group_display_name' <<<"$ENTRY")
+          mkdir -p migration
+          sqlpackage /Action:DeployReport /SourceFile:"artifacts/${DB}.dacpac" \
+            /TargetServerName:"tcp:${server},1433" /TargetDatabaseName:"$dbname" /AccessToken:"$token" /TargetTimeout:60 \
+            /v:ReaderGroupName="$rg_name" /v:ReaderGroupObjectId="$rg_oid" \
+            /Profile:"$PROFILE" /p:DropObjectsNotInSource=True /p:BlockOnPossibleDataLoss=False \
+            /p:ExcludeObjectTypes="Users;RoleMembership;Permissions;ExtendedProperties;Logins" \
+            /OutputPath:"migration/${DB}.driftreport.xml"
+          # The DeployReport XML nests <Item Value="..."/> under <Operation Name="...">; list
+          # every item under a Drop* operation. Line-oriented perl is enough for this schema.
+          mapfile -t drifted < <(perl -ne '
+            if (/<Operation Name="(Drop[^"]*)"/) { $op = $1 }
+            elsif (/<Operation Name="/) { $op = "" }
+            print "$op: $1\n" if $op && /<Item Value="([^"]*)"/;
+            $op = "" if /<\/Operation>/;
+          ' "migration/${DB}.driftreport.xml")
+          if [ "${#drifted[@]}" -gt 0 ]; then
+            {
+              echo "### :rotating_light: Drift detected: \`$DB\` ($ENVIRONMENT)"
+              echo ""
+              echo "The live database contains objects the source does not declare:"
+              printf -- '- `%s`\n' "${drifted[@]}"
+              echo ""
+              echo "Reconcile: add the object to \`databases/${DB}/\` (adopt it) or remove it from the target, then re-run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf '::error::drift in %s (%s): %s\n' "$DB" "$ENVIRONMENT" "${drifted[*]}"
+            exit 1
+          fi
+          echo "No drift: the target declares nothing the source does not."
+
+      - name: Skip if the deployed source hash already matches (no-op leg)
+        id: skipcheck
+        if: steps.tf.outputs.provisioned == 'true'
+        env:
+          ENTRY: ${{ steps.tf.outputs.entry }}
+        run: |
+          set -euo pipefail
+          # The dacpac's BYTES change every build (DacVersion stamp), so the "did anything change?"
+          # marker is a hash of the deploy-relevant SOURCES: this database's folder, the shared
+          # publish inputs, and the SqlPackage version (a new engine can plan differently for the
+          # same sources). The hash is stamped as an extended property after every publish (step 4b);
+          # when the stamp already matches, the publish AND the data migrations are provably
+          # re-runs of what this database already received, so the leg skips - which keeps redundant
+          # matrix legs nearly free and, on small capacities, keeps them from burning CU on diffs.
+          srchash=$(git ls-tree HEAD "databases/${DB}" deploy databases/Directory.Build.props databases/Directory.Build.targets build.proj \
+                    | cat - <(echo "sqlpackage=${SQLPACKAGE_VERSION}") | sha256sum | cut -c1-64)
+          server=$(jq -r '.sql_server_fqdn' <<<"$ENTRY"); server="${server#tcp:}"; server="${server%%,*}"
+          dbname=$(jq -r '.sql_database_name' <<<"$ENTRY")
+          deployed=$(sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b -h -1 -W \
+            -Q "SET NOCOUNT ON; SELECT CONVERT(NVARCHAR(128), value) FROM sys.extended_properties WHERE class = 0 AND name = N'DeployedSourceHash';" 2>/dev/null || true)
+          deployed="${deployed//[$'\r\n ']/}"
+          echo "srchash=$srchash" >> "$GITHUB_OUTPUT"
+          if [ -n "$deployed" ] && [ "$deployed" = "$srchash" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DB in $ENVIRONMENT already has source hash $srchash - nothing to deploy."
+            echo "### Deploy: \`$DB\` ($ENVIRONMENT) - **skipped, already up to date** (source hash \`${srchash:0:12}…\`)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Plan the migration (exact T-SQL + data-loss digest into the run summary)
+        id: plan
+        if: steps.tf.outputs.provisioned == 'true' && steps.skipcheck.outputs.skip != 'true'
+        uses: ./.github/actions/plan-migration
+        with:
+          database: ${{ inputs.database }}
+          environment: ${{ inputs.environment }}
+          entry: ${{ steps.tf.outputs.entry }}
+
+      - name: Download the reviewed plan
+        if: steps.tf.outputs.provisioned == 'true' && steps.skipcheck.outputs.skip != 'true' && inputs.plan_artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.plan_artifact }}
+          path: reviewed-plan
+
+      - name: Verify this plan matches the plan the reviewer approved
+        if: steps.tf.outputs.provisioned == 'true' && steps.skipcheck.outputs.skip != 'true' && inputs.plan_artifact != ''
+        run: |
+          set -euo pipefail
+          # The approval gate paused BEFORE this job ran, so the reviewer approved the PRE-GATE
+          # plan. This leg just re-planned against the live target; if the target changed in
+          # between (drift, a concurrent change), the fingerprints differ and NOTHING publishes -
+          # the approved plan is the only plan that applies. Re-run the pipeline to produce and
+          # approve a fresh plan.
+          reviewed=$(cat "reviewed-plan/${DB}.fingerprint")
+          current=$(cat "migration/${DB}.fingerprint")
+          if [ "$reviewed" != "$current" ]; then
+            {
+              echo "### :x: \`$DB\` ($ENVIRONMENT): plan changed since approval"
+              echo ""
+              echo "- reviewed \`${reviewed:0:16}…\` vs current \`${current:0:16}…\`"
+              echo ""
+              echo "The target changed between review and apply. Nothing was published."
+              echo "Re-run the pipeline (Re-run all jobs) to generate and approve a fresh plan."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$DB ($ENVIRONMENT): the live plan no longer matches the reviewed plan (reviewed ${reviewed:0:16}… vs current ${current:0:16}…). Nothing was published - re-run the pipeline to review the new plan."
+            exit 1
+          fi
+          echo "Plan verified: fingerprint ${current:0:16}… matches the reviewed plan."
+
+      - name: Publish, stamp, smoke-check, run data migrations
+        if: steps.tf.outputs.provisioned == 'true' && steps.skipcheck.outputs.skip != 'true'
+        env:
+          PROFILE: deploy/fabric.publish.xml
+          ENTRY: ${{ steps.tf.outputs.entry }}
+          ALLOW_DATA_LOSS: ${{ inputs.allow_data_loss }}
+          SRCHASH: ${{ steps.skipcheck.outputs.srchash }}
+        run: |
+          set -euo pipefail
+          mkdir -p migration
+
+          # Retry a command with exponential backoff. Fabric SQL is serverless: the first connect
+          # after idle can fail while the database resumes, and a transient auth/network blip must
+          # not fail a whole deploy. SqlPackage re-diffs on each attempt, so a retried publish is safe.
+          retry() {
+            local n=1 max=4 delay=15
+            until "$@"; do
+              if [ "$n" -ge "$max" ]; then echo "::error::command failed after $max attempts."; return 1; fi
+              echo "::warning::attempt $n/$max failed; retrying in ${delay}s (Fabric serverless resume can take a moment)..."
+              sleep "$delay"; delay=$((delay * 2)); n=$((n + 1))
+            done
+          }
+
+          # One Fabric SQL access token for this job's identity (audience = SQL). Acquired and used
+          # within this step so it never crosses a step boundary or lands in an artifact.
+          token=$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)
+          echo "::add-mask::$token"
+
+          # sql_server_fqdn from Terraform already includes the ,1433 port (and may carry a tcp:
+          # prefix); normalize to the bare host so we compose exactly one "tcp:<host>,1433".
+          server=$(jq -r '.sql_server_fqdn' <<<"$ENTRY"); server="${server#tcp:}"; server="${server%%,*}"
+          dbname=$(jq -r '.sql_database_name'          <<<"$ENTRY")
+          rg_oid=$(jq -r '.reader_group_object_id'     <<<"$ENTRY")
+          rg_name=$(jq -r '.reader_group_display_name' <<<"$ENTRY")
+          target=(/TargetServerName:"tcp:${server},1433" /TargetDatabaseName:"$dbname" /AccessToken:"$token" /TargetTimeout:60)
+          readervars=(/v:ReaderGroupName="$rg_name" /v:ReaderGroupObjectId="$rg_oid")
+
+          # The version stamped into this dacpac at build time (DacVersion=1.0.<run>). Shown in the
+          # deploy summary and written to the database (step 4b) as the "what's deployed here" marker.
+          dacver=$(unzip -p "artifacts/${DB}.dacpac" DacMetadata.xml 2>/dev/null | grep -oE '<Version>[^<]+</Version>' | sed -E 's|</?Version>||g'); dacver="${dacver:-unknown}"
+          echo "- **Version:** \`$dacver\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # The exact T-SQL and the data-loss digest were produced by the plan-migration step
+          # above (migration/${DB}.sql et al) and are already in this run's summary. For prod,
+          # the verify step has confirmed that plan is fingerprint-identical to the one the
+          # reviewer approved before the gate.
+
+          # 3) Prod pre-deploy export (the rollback artifact - state before this deploy). BLOCKING:
+          #    the export IS the way back, so if it can't be produced we stop BEFORE publishing rather
+          #    than deploy with no rollback. retry() already absorbs a transient serverless-resume
+          #    blip; a persistent failure returns non-zero and `set -e` aborts the leg before step 4.
+          #    (The export lands in the run's artifact; a bacpac is a logical export, so verify
+          #    any copy you intend to rely on.)
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            retry sqlpackage /Action:Export \
+              /SourceServerName:"tcp:${server},1433" /SourceDatabaseName:"$dbname" /AccessToken:"$token" \
+              /TargetFile:"migration/${DB}.pre-deploy.bacpac"
+          fi
+
+          # 4) Publish under the checked-in safety profile. allow_data_loss relaxes
+          #    BlockOnPossibleDataLoss so a reviewed destructive change can actually apply;
+          #    otherwise the profile's True stands and a data-loss publish terminates.
+          publishprops=(); [ "$ALLOW_DATA_LOSS" = "true" ] && publishprops=(/p:BlockOnPossibleDataLoss=False)
+          retry sqlpackage /Action:Publish /SourceFile:"artifacts/${DB}.dacpac" \
+            "${target[@]}" "${readervars[@]}" \
+            /Profile:"$PROFILE" "${publishprops[@]}"
+
+          # 4b) Stamp the deployed version onto the database as an extended property, so an operator
+          #     can answer "what's deployed here?" with one query against the database itself:
+          #       SELECT CONVERT(nvarchar(128), value) FROM sys.extended_properties
+          #       WHERE class = 0 AND name = 'DeployedDacVersion';
+          #     Add-or-update, so it is idempotent. Best-effort: a failure here never fails a deploy
+          #     whose schema already published (the property is a convenience marker, not the schema).
+          #     NOTE: DeployedSourceHash (the no-op-skip marker) is stamped in 4c AFTER the data
+          #     migrations, so a leg that dies mid-migrations is NOT marked complete and re-runs.
+          retry sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b \
+            -Q "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 0 AND name = N'DeployedDacVersion') EXEC sys.sp_updateextendedproperty @name = N'DeployedDacVersion', @value = N'${dacver}'; ELSE EXEC sys.sp_addextendedproperty @name = N'DeployedDacVersion', @value = N'${dacver}';" \
+            || echo "::warning::could not stamp DeployedDacVersion on $dbname (schema publish already succeeded)."
+
+          # 5) Post-publish smoke check: confirm the database is reachable and the schema is present.
+          #    A publish can report success but leave the database unhealthy or empty; fail the deploy
+          #    fast here rather than discovering it downstream. Capture the object count for the summary.
+          echo "::group::smoke check"
+          n_objects=$(retry sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b -h -1 -W \
+            -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.objects WHERE is_ms_shipped = 0;")
+          n_objects="${n_objects//[!0-9]/}"
+          if [ "${n_objects:-0}" -eq 0 ]; then echo "::error::Smoke check failed: no user objects after publish."; exit 1; fi
+          echo "Smoke check OK: $n_objects user objects."
+          echo "- **Smoke check:** $n_objects user objects" >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+
+          # 6) Data migrations: run this database's Scripts/DataMigrations/*.sql in name order,
+          #    AFTER the schema publish. Each script is idempotent and state-guarded, so re-running
+          #    on every deploy is safe. sqlcmd authenticates as this job's managed identity.
+          #    retry() wraps each script for the SAME reason the publish is retried: a serverless-
+          #    resume/network blip must not fail the deploy AFTER the schema already published (which
+          #    would leave schema at N+1 with migrations unapplied). Idempotency makes the retry safe;
+          #    a genuine script error still fails after the attempts are exhausted.
+          shopt -s nullglob
+          migs=("databases/${DB}/Scripts/DataMigrations"/*.sql)
+          applied=()
+          if [ "${#migs[@]}" -gt 0 ]; then
+            while IFS= read -r m; do
+              echo "::group::data migration $(basename "$m")"
+              retry sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b -i "$m"
+              applied+=("$(basename "$m")")
+              echo "::endgroup::"
+            done < <(printf '%s\n' "${migs[@]}" | sort)
+          else
+            echo "No data migrations for $DB."
+          fi
+          if [ "${#applied[@]}" -gt 0 ]; then
+            echo "- **Data migrations applied:** $(printf '`%s` ' "${applied[@]}")" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Data migrations applied:** none" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # 4c) Stamp the deployed SOURCE hash - the no-op-skip marker checked before publishing.
+          #     Last, deliberately: only a leg that completed the publish AND its data migrations
+          #     is "already up to date". Best-effort, like 4b: on failure the next run simply
+          #     re-publishes (a safe no-op diff) instead of skipping.
+          retry sqlcmd -S "tcp:${server},1433" -d "$dbname" --authentication-method ActiveDirectoryDefault -b \
+            -Q "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 0 AND name = N'DeployedSourceHash') EXEC sys.sp_updateextendedproperty @name = N'DeployedSourceHash', @value = N'${SRCHASH}'; ELSE EXEC sys.sp_addextendedproperty @name = N'DeployedSourceHash', @value = N'${SRCHASH}';" \
+            || echo "::warning::could not stamp DeployedSourceHash on $dbname (the next deploy will re-publish instead of skipping)."
+
+      # Write the deployed-before marker consumed by the fail-fast readiness wait (see above).
+      # Runs on a successful publish OR a hash-skip - both prove the pair has deployed before.
+      - name: Save the deployed-before marker
+        if: steps.tf.outputs.provisioned == 'true' && steps.marker.outputs.cache-hit != 'true' && success()
+        run: echo "deployed" > .deployed-marker
+      - uses: actions/cache/save@v4
+        if: steps.tf.outputs.provisioned == 'true' && steps.marker.outputs.cache-hit != 'true' && success()
+        with:
+          path: .deployed-marker
+          key: deployed-${{ inputs.environment }}-${{ inputs.database }}-${{ fromJson(steps.tf.outputs.entry).workspace_id }}
+
+      - name: Upload migration script + report (the reviewable record of this deploy)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: migration-${{ inputs.environment }}-${{ inputs.database }}-${{ github.sha }}
+          path: migration/
+          if-no-files-found: ignore

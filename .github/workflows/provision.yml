@@ -1,0 +1,167 @@
+name: Provision (Terraform)
+
+# Stand up / update the Fabric estate (workspaces, SQL database items, workspace role
+# assignments, reader groups) with Terraform. Validation is OFFLINE and runs on every PR that
+# touches the Terraform, matching the "the gate never touches the cloud" principle. A real
+# plan/apply is a manual, environment-gated action. The empty databases this creates are filled
+# with schema by deploy.yml.
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/provision.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, test, prod]
+      apply:
+        description: Apply the plan (leave unchecked to plan only)
+        required: true
+        type: boolean
+        default: false
+      confirm_destroy:
+        description: Confirm you intend to DESTROY resources (required when the plan deletes anything, e.g. a decommission)
+        required: false
+        type: boolean
+        default: false
+
+# id-token is granted per-job (only plan-apply logs in); the offline validate job, which also
+# runs untrusted PR code, stays read-only.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: infra/terraform
+
+jobs:
+  # Offline checks - no cloud credentials. Runs on PRs and before any dispatched plan/apply.
+  # Named distinctly from pr-validation.yml's `validate` job so the two status checks don't collide.
+  terraform-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate
+
+  # Real plan/apply against one environment. Manual only; the `environment` binding selects that
+  # environment's variables + state and (for prod) pauses for a required reviewer.
+  plan-apply:
+    if: github.event_name == 'workflow_dispatch'
+    needs: terraform-validate
+    runs-on: ubuntu-latest
+    # Bounded: apply + one throttling retry (120s pause + re-plan) fits well inside this;
+    # a hung provider call fails the run instead of idling for the 6-hour default.
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # OIDC login to the managed identity happens only in this job
+    env:
+      FABRIC_USE_OIDC: "true"
+      FABRIC_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      FABRIC_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: Materialize tfvars from GitHub environment variables
+        # The real *.tfvars are gitignored (identifiers kept out of the public repo). CI rebuilds
+        # them from the environment's variables, so there is one source of truth per environment
+        # and nothing sensitive is committed. JSON keeps every value correctly typed; optional
+        # values are only added when the variable is set (an empty string would mis-type).
+        run: |
+          # The capacity can be referenced by NAME (FABRIC_CAPACITY_NAME - the friendly path; the
+          # identity resolves it and validates it is Active) or by ID (FABRIC_CAPACITY_ID - for
+          # capacities the identity can't enumerate, e.g. a trial). Terraform requires exactly one,
+          # so setting both is refused here with a clear message rather than failing in the plan.
+          if [ -n "${{ vars.FABRIC_CAPACITY_ID }}" ] && [ -n "${{ vars.FABRIC_CAPACITY_NAME }}" ]; then
+            echo "::error::Set FABRIC_CAPACITY_ID or FABRIC_CAPACITY_NAME for this environment, not both."
+            exit 1
+          fi
+          jq -n \
+            --arg env  "${{ inputs.environment }}" \
+            --arg cap  "${{ vars.FABRIC_CAPACITY_ID }}" \
+            --arg capn "${{ vars.FABRIC_CAPACITY_NAME }}" \
+            --arg skip "${{ vars.SKIP_CAPACITY_STATE_VALIDATION }}" \
+            --arg ret  "${{ vars.TF_BACKUP_RETENTION_DAYS }}" \
+            --argjson dbs '${{ vars.TF_DATABASES }}' \
+            --argjson ops '${{ vars.TF_WORKSPACE_OPERATORS || '{}' }}' \
+            '{ environment: $env, databases: $dbs, workspace_operators: $ops }
+              + (if $cap  != "" then { capacity_id: $cap }                              else {} end)
+              + (if $capn != "" then { capacity_name: $capn }                           else {} end)
+              + (if $skip != "" then { skip_capacity_state_validation: ($skip == "true") } else {} end)
+              + (if $ret  != "" then { default_backup_retention_days: ($ret | tonumber) } else {} end)' \
+            > generated.auto.tfvars.json
+          # Print only the KEYS - the values are identifiers kept out of this public repo's logs.
+          echo "Generated tfvars keys:"; jq 'keys' generated.auto.tfvars.json
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ vars.TFSTATE_KEY }}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Guard against unexpected destroys
+        # R1: the databases map has two sources (local *.tfvars and the TF_DATABASES var). A key
+        # missing from the map you apply with makes for_each DESTROY that database's workspace,
+        # SQL database, and reader group - a workspace delete is unrecoverable. Block apply when
+        # the plan deletes anything unless the operator deliberately confirms (a real decommission).
+        run: |
+          terraform show -json tfplan > tfplan.json
+          mapfile -t dels < <(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' tfplan.json)
+          if [ "${#dels[@]}" -eq 0 ]; then echo "Plan destroys nothing."; exit 0; fi
+          printf '::warning::plan destroys: %s\n' "${dels[@]}"
+          if [ "${{ inputs.apply }}" = "true" ] && [ "${{ inputs.confirm_destroy }}" != "true" ]; then
+            echo "::error::Plan would DESTROY ${#dels[@]} resource(s) (listed above). If intended (e.g. a decommission), re-run with apply + confirm_destroy=true."
+            exit 1
+          fi
+
+      - name: terraform apply
+        if: ${{ inputs.apply }}
+        run: |
+          set -uo pipefail
+          # One retry, only for the Fabric provider's throttling signature. On a small SKU
+          # (F2/F4) a burst of item creations can exceed the capacity's smoothed budget and the
+          # in-flight creation times out with "context deadline exceeded" even though nothing is
+          # misconfigured (docs/operations.md). The saved plan is consumed by the failed apply, so
+          # the retry re-plans and re-applies the remainder - and re-runs the destroy guard against
+          # the NEW plan first, so the retry can never destroy anything the first plan didn't.
+          terraform apply -input=false tfplan 2>&1 | tee apply.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ] && grep -q "context deadline exceeded" apply.log; then
+            echo "::warning::apply hit a provider timeout (capacity throttling signature); waiting 120s and retrying the remainder once..."
+            sleep 120
+            terraform plan -input=false -out=tfplan.retry
+            terraform show -json tfplan.retry > tfplan.retry.json
+            mapfile -t dels < <(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' tfplan.retry.json)
+            if [ "${#dels[@]}" -gt 0 ] && [ "${{ inputs.confirm_destroy }}" != "true" ]; then
+              printf '::error::retry plan would DESTROY: %s\n' "${dels[@]}"
+              exit 1
+            fi
+            terraform apply -input=false tfplan.retry
+          else
+            exit "$rc"
+          fi

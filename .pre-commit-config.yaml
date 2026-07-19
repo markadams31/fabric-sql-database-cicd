@@ -1,0 +1,36 @@
+# Automatic local checks, so nobody has to remember to run a script.
+# One-time setup after cloning:
+#   pip install pre-commit
+#   pre-commit install            # lint on commit
+#   pre-commit install -t pre-push  # build on push
+#
+# CI (.github/workflows/pr-validation.yml) runs the same checks as the authoritative gate;
+# these hooks just give faster local feedback.
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  # Style — lint the T-SQL source on every commit (fast). Uses .sqlfluff AND this repo's
+  # custom SQLFluff rule plugin (analyzers/sqlfluff-fabric-rules), so it runs sqlfluff from
+  # your environment rather than a managed one. One-time (see docs/local-development.md):
+  #   pip install sqlfluff==4.2.2 -e ./analyzers/sqlfluff-fabric-rules
+  - repo: local
+    hooks:
+      - id: sqlfluff-lint
+        name: sqlfluff lint (T-SQL style + custom rules)
+        entry: sqlfluff lint databases
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+  # Schema + conventions — build every project on every push. The build runs all code
+  # analysis rules (SqlServer.Rules + the custom rules); escalated rules fail it.
+  - repo: local
+    hooks:
+      - id: dotnet-build
+        name: dotnet build (schema validation + code analysis)
+        entry: dotnet build build.proj
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -1,0 +1,259 @@
+name: Deploy (build once, promote)
+
+# Build the dacpacs ONCE, then promote those exact artifacts dev -> test -> prod. Within each
+# environment, every database deploys as its OWN matrix leg (fail-fast off), so one database's
+# failure never strands another. prod pauses for its required reviewer.
+#
+# Provisioning (provision.yml) creates the empty Fabric SQL databases; this workflow fills them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "databases/**"
+      - "deploy/**"
+      - "build.proj"
+      - "Directory.Build.props"
+      - ".github/workflows/deploy*.yml"
+  workflow_dispatch:
+    inputs:
+      allow_data_loss:
+        description: "Permit a destructive (data-loss) change on dev/test - a reviewed override"
+        required: false
+        type: boolean
+        default: false
+      allow_data_loss_prod:
+        description: "Permit a destructive (data-loss) change on PROD - a SEPARATE deliberate override (prod also requires its reviewer). Relaxing dev/test does NOT relax prod."
+        required: false
+        type: boolean
+        default: false
+
+# No workflow-level concurrency: serialization is per-(database, environment) in deploy-env.yml,
+# so a pending approval on one target can't freeze unrelated deploys.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read # list previous runs of this workflow to find the last deployed commit
+    outputs:
+      databases: ${{ steps.list.outputs.databases }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history so we can diff against the last successful deploy
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.sqlproj', '**/*.csproj', 'NuGet.config') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Build every SQL project, stamped for traceability
+        # DacVersion stamps the dacpac so an environment can report its deployed version; the
+        # commit SHA rides along in the artifact name. This is the one build that gets promoted.
+        run: dotnet build build.proj -c Release -p:DacVersion=1.0.${{ github.run_number }}
+      - name: Collect the built dacpacs
+        run: |
+          mkdir -p artifacts
+          find databases -path '*/bin/Release/*.dacpac' -exec cp {} artifacts/ \;
+          ls -l artifacts
+      - name: List databases to deploy (one matrix leg each)
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          all=$(cd artifacts && ls *.dacpac | sed 's/\.dacpac$//' | jq -R . | jq -sc .)
+
+          # Change-aware matrix: on a push, deploy only the databases whose sources changed since
+          # the last SUCCESSFUL run of this workflow (a database's own folder, or any shared input:
+          # deploy/, the shared props/targets, build.proj, these workflows). Anything unclear -
+          # dispatch, no previous success, API hiccup, diff failure - falls back to deploying ALL,
+          # because a redundant leg is a cheap no-op (the leg itself skips an unchanged database via
+          # its source-hash stamp) while a missed leg is real drift.
+          dbs="$all"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            base=$(gh api "repos/${{ github.repository }}/actions/workflows/deploy.yml/runs?status=success&branch=main&per_page=1" \
+                     --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)
+            if [ -n "$base" ] && git cat-file -e "$base" 2>/dev/null; then
+              changed=$(git diff --name-only "$base" HEAD || echo "__diff_failed__")
+              if [ "$changed" != "__diff_failed__" ]; then
+                if grep -qE '^(deploy/|build\.proj|Directory\.Build\.props|databases/Directory\.Build\.|\.github/workflows/deploy)' <<<"$changed"; then
+                  echo "Shared deploy input changed since $base - deploying all databases."
+                else
+                  dbs=$(jq -c --arg changed "$changed" '[.[] as $db | select($changed | test("^databases/" + $db + "/"; "m")) | $db]' <<<"$all")
+                  echo "Changed since last successful deploy ($base): $dbs"
+                fi
+              fi
+            else
+              echo "No previous successful deploy found - deploying all databases."
+            fi
+          fi
+
+          if [ "$(jq 'length' <<<"$dbs")" -eq 0 ]; then
+            echo "::notice::No database sources changed since the last successful deploy - nothing to deploy."
+          fi
+          echo "databases=$dbs" >> "$GITHUB_OUTPUT"
+          echo "Databases: $dbs"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dacpac-${{ github.sha }}
+          path: artifacts/*.dacpac
+          if-no-files-found: error
+
+  dev:
+    needs: build
+    if: needs.build.outputs.databases != '[]' # an empty matrix is invalid; skip the env jobs instead
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ${{ fromJson(needs.build.outputs.databases) }}
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: dev
+      database: ${{ matrix.database }}
+      artifact: dacpac-${{ github.sha }}
+      allow_data_loss: ${{ inputs.allow_data_loss || false }}
+
+  test:
+    needs: [build, dev] # dev = promotion order; build = the databases matrix list
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ${{ fromJson(needs.build.outputs.databases) }}
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: test
+      database: ${{ matrix.database }}
+      artifact: dacpac-${{ github.sha }}
+      allow_data_loss: ${{ inputs.allow_data_loss || false }}
+
+  # The plan the prod reviewer actually approves. Runs AFTER test passes but BEFORE prod's
+  # approval gate (this job is not environment-bound; it authenticates through the identity's
+  # main-branch federated credential and only reads). It writes each database's exact prod
+  # migration T-SQL and data-loss digest to the run summary - so the approval page answers
+  # "what will change, and what data dies?" - and uploads the plan's fingerprint. The prod leg
+  # re-plans after approval and refuses to publish unless the fingerprints match, so the
+  # approved plan is the only plan that can apply (plan -> approve -> verify -> apply).
+  prod-plan:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ${{ fromJson(needs.build.outputs.databases) }}
+    env:
+      DB: ${{ matrix.database }}
+      SQLPACKAGE_VERSION: "170.4.83" # keep in step with deploy-env.yml
+      SQLCMD_VERSION: "v1.10.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dacpac-${{ github.sha }}
+          path: artifacts
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: Cache SqlPackage + sqlcmd
+        id: toolcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.dotnet/tools
+            ~/sqlcmd-bin
+          key: sqltools-${{ runner.os }}-sqlpackage-${{ env.SQLPACKAGE_VERSION }}-sqlcmd-${{ env.SQLCMD_VERSION }}
+      - name: Install SqlPackage
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.toolcache.outputs.cache-hit }}" != "true" ]; then
+            dotnet tool install --global Microsoft.SqlPackage --version "$SQLPACKAGE_VERSION"
+            mkdir -p "$HOME/sqlcmd-bin"
+            curl -fsSL "https://github.com/microsoft/go-sqlcmd/releases/download/${SQLCMD_VERSION}/sqlcmd-linux-amd64.tar.bz2" -o /tmp/sqlcmd.tar.bz2
+            tar xjf /tmp/sqlcmd.tar.bz2 -C "$HOME/sqlcmd-bin" sqlcmd
+          fi
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+      - name: Azure login (main-branch federated credential - no environment gate)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
+      - name: Resolve this database's prod endpoint from Terraform state
+        id: tf
+        working-directory: infra/terraform
+        env:
+          # prod's variables live in the prod GitHub environment, which this job deliberately
+          # does not bind (binding it would gate the plan behind the approval it exists to
+          # inform). The state backend identifiers are repository-level; only the state KEY is
+          # per-environment, and prod's follows the documented convention.
+          TFSTATE_KEY_PROD: prod.tfstate
+        run: |
+          set -euo pipefail
+          terraform init -input=false \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${TFSTATE_KEY_PROD}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform output -json databases > "$RUNNER_TEMP/dbs.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/dbs.json"
+          entry=$(jq -c --arg k "$DB" '.[$k] // empty' "$RUNNER_TEMP/dbs.json")
+          if [ -z "$entry" ]; then
+            echo "provisioned=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DB is not provisioned in prod - nothing to plan."
+          else
+            echo "provisioned=true" >> "$GITHUB_OUTPUT"
+            echo "entry=$entry" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Plan the prod migration (what the reviewer approves)
+        if: steps.tf.outputs.provisioned == 'true'
+        uses: ./.github/actions/plan-migration
+        with:
+          database: ${{ matrix.database }}
+          environment: prod (pre-approval plan)
+          entry: ${{ steps.tf.outputs.entry }}
+      - name: Upload the reviewed plan (the fingerprint the prod leg must match)
+        if: steps.tf.outputs.provisioned == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: prodplan-${{ matrix.database }}-${{ github.sha }}
+          path: migration/
+          if-no-files-found: error
+
+  prod:
+    needs: [build, test, prod-plan] # prod-plan = the reviewed plan; the gate pauses AFTER it exists
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ${{ fromJson(needs.build.outputs.databases) }}
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: prod
+      database: ${{ matrix.database }}
+      artifact: dacpac-${{ github.sha }}
+      allow_data_loss: ${{ inputs.allow_data_loss_prod || false }} # prod has its own override
+      plan_artifact: prodplan-${{ matrix.database }}-${{ github.sha }}

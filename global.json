@@ -1,0 +1,6 @@
+{
+  "msbuild-sdks": {
+    "Microsoft.Build.Sql": "2.2.0",
+    "Microsoft.Build.Traversal": "4.1.82"
+  }
+}

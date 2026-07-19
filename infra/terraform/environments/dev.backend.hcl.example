@@ -1,0 +1,9 @@
+# Copy to dev.backend.hcl (git-ignored) and fill in your state storage details, then:
+#   terraform init -reconfigure -backend-config=environments/dev.backend.hcl
+#
+# Auth is Microsoft Entra data-plane (use_azuread_auth is set in terraform.tf), so the
+# caller needs only Storage Blob Data Contributor on the container.
+storage_account_name = "<state-storage-account-name>"
+container_name       = "<state-container-name>"
+key                  = "dev.tfstate"
+tenant_id            = "<entra-tenant-id>"

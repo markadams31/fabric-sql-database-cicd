@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlfluff-fabric-rules"
+version = "0.1.0"
+description = "Custom SQLFluff style rules for the Fabric SQL CI/CD reference solution."
+requires-python = ">=3.9"
+dependencies = ["sqlfluff==4.2.2"]
+
+# Registers this package as a SQLFluff plugin. SQLFluff discovers it once the package is
+# installed (pip install -e analyzers/sqlfluff-fabric-rules), the same way it finds core rules.
+[project.entry-points.sqlfluff]
+sqlfluff_fabric_rules = "sqlfluff_fabric_rules"
+
+[tool.setuptools.packages.find]
+where = ["src"]

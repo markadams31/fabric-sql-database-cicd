@@ -1,0 +1,35 @@
+# Copy to dev.tfvars (git-ignored) and fill in your identifiers.
+# These are identifiers, not secrets, but the real file stays out of a public repo.
+
+environment = "dev"
+
+# Reference the Fabric capacity ONE of two ways:
+#
+#   By display name — normal F-SKU capacities the calling identity can enumerate:
+#     capacity_name = "my-fabric-capacity"
+#
+#   By ID, with the state read skipped — needed for trial capacities, or whenever the
+#   calling identity can't resolve the capacity by name (set exactly one of the two):
+capacity_id                    = "00000000-0000-0000-0000-000000000000"
+skip_capacity_state_validation = true
+
+# Default PITR retention (1-35 days) for databases that don't override it.
+default_backup_retention_days = 7
+
+# Operator access, applied to EVERY workspace in this environment. When CI provisions the
+# estate, the deploy identity is the only principal on each new workspace — grant your team's
+# security group here so humans can see the workspaces and perform the item-share step.
+# (Do NOT list the deploy identity; it is granted Admin implicitly as the creator.)
+workspace_operators = {
+  team = {
+    principal_id   = "00000000-0000-0000-0000-000000000000" # Entra group object ID
+    principal_type = "Group"
+    role           = "Admin"
+  }
+}
+
+# One entry per database — each becomes its own Fabric workspace ("<name> [dev]").
+# Keep this map identical across dev/test/prod.
+databases = {
+  AppDb = {}
+}

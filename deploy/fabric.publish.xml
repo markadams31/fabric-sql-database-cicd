@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  fabric.publish.xml - the deploy contract for publishing a dacpac into a SQL database in
+  Microsoft Fabric with SqlPackage. Checked in so the safety properties are reviewed as code
+  and are identical in every environment; the deploy workflow consumes it with /Profile:.
+
+  Two rules make this file trustworthy:
+    1. It sets SAFETY behaviour only, never a target. The server, database, and the SQLCMD
+       reader-group variables are supplied at deploy time from the Terraform outputs (one
+       source of truth), so this file has nothing environment-specific to drift.
+    2. A CLI /p: overrides a profile value. The migration PREVIEW step deliberately passes
+       /p:BlockOnPossibleDataLoss=False so a script always generates for review; the real
+       Publish step passes only /Profile:, so the True below governs the actual deploy.
+
+  Property reference: https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-publish
+-->
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <!-- ===== DATA-LOSS SAFETY (never weaken) ===== -->
+    <!-- Abort if the schema change could lose data - a drop, a narrowing type change, a
+         precision reduction. The single most important switch. -->
+    <BlockOnPossibleDataLoss>True</BlockOnPossibleDataLoss>
+    <!-- Run DacFx's pre-publish blocking checks against the generated plan and stop if it would
+         fail (e.g. an unresolved reference). A safety net, not a data-loss risk. -->
+    <VerifyDeployment>True</VerifyDeployment>
+
+    <!-- ===== NEVER DROP WHAT THE PROJECT DID NOT DECLARE ===== -->
+    <!-- Objects in the target but absent from the dacpac are left alone. Essential for
+         build-once/promote: an object created out of band is never destroyed by a deploy. -->
+    <DropObjectsNotInSource>False</DropObjectsNotInSource>
+    <!-- Permissions and role memberships are additive; grants made in the database are not
+         stripped. (DacFx decoupled these from DropObjectsNotInSource in build 162.1.167.) -->
+    <DropPermissionsNotInSource>False</DropPermissionsNotInSource>
+    <DropRoleMembersNotInSource>False</DropRoleMembersNotInSource>
+    <!-- Belt-and-suspenders: even if DropObjectsNotInSource is ever flipped True, never drop
+         these types. (Inert while DropObjectsNotInSource is False.) -->
+    <DoNotDropObjectTypes>Users;Permissions;RoleMembership;Logins</DoNotDropObjectTypes>
+
+    <!-- Subordinate drops (children of objects that ARE in source) default True, so the target
+         converges to the project: a stray index/constraint/trigger the project no longer
+         declares is removed. Flip an individual one to False if that object type is
+         deliberately hand-managed in the target (e.g. a DBA-tuned index not in the project). -->
+    <DropConstraintsNotInSource>True</DropConstraintsNotInSource>
+    <DropIndexesNotInSource>True</DropIndexesNotInSource>
+    <DropDmlTriggersNotInSource>True</DropDmlTriggersNotInSource>
+    <DropStatisticsNotInSource>True</DropStatisticsNotInSource>
+    <DropExtendedPropertiesNotInSource>True</DropExtendedPropertiesNotInSource>
+
+    <!-- ===== PERMISSIONS AS CODE ===== -->
+    <!-- False = the project owns permissions; GRANT/DENY in source are applied to converge the
+         target (non-destructive - nothing is dropped, see Drop*NotInSource above). Set BOTH to
+         True only if Fabric users/roles are managed entirely via Entra/portal outside the
+         project and publish should not touch security. -->
+    <IgnorePermissions>False</IgnorePermissions>
+    <IgnoreRoleMembership>False</IgnoreRoleMembership>
+
+    <!-- ===== FABRIC PLATFORM ALIGNMENT ===== -->
+    <!-- The dacpac is built against the Fabric database schema provider, so keep platform
+         validation ON. Set True only to publish a dacpac built for a DIFFERENT platform
+         (Azure SQL DB / SQL Server); Fabric docs restrict that to the cross-platform case. -->
+    <AllowIncompatiblePlatform>False</AllowIncompatiblePlatform>
+    <!-- Do not script ALTER DATABASE SET options. Fabric marks those options preview, collation
+         is immutable after creation, and TDE is unsupported - this mirrors Fabric's own
+         git-integration publish, which sets False to avoid emitting statements Fabric rejects. -->
+    <ScriptDatabaseOptions>False</ScriptDatabaseOptions>
+
+    <!-- Single self-contained project (no composite .dacpac references). -->
+    <IncludeCompositeObjects>False</IncludeCompositeObjects>
+    <!-- Supply a default when a new NOT NULL column is added to a populated table, so the
+         change applies instead of failing. -->
+    <GenerateSmartDefaults>True</GenerateSmartDefaults>
+    <!-- This is not a data-tier application; do not register one. -->
+    <RegisterDataTierApplication>False</RegisterDataTierApplication>
+    <CommandTimeout>120</CommandTimeout>
+  </PropertyGroup>
+</Project>

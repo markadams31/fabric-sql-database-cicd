@@ -1,0 +1,10 @@
+# Normalize line endings so checkouts are identical on every OS. Text files are stored with
+# LF in the repository and checked out as LF everywhere — shell scripts in particular must
+# stay LF to run in bash and in the Linux SQL Server container.
+* text=auto eol=lf
+
+# Declare intent for binaries (none committed today, but keep them out of normalization).
+*.dacpac binary
+*.png    binary
+*.jpg    binary
+*.ico    binary

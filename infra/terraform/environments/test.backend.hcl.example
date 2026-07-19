@@ -1,0 +1,5 @@
+# Copy to test.backend.hcl (git-ignored). See dev.backend.hcl.example for details.
+storage_account_name = "<state-storage-account-name>"
+container_name       = "<state-container-name>"
+key                  = "test.tfstate"
+tenant_id            = "<entra-tenant-id>"
